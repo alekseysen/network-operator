@@ -16,7 +16,7 @@
 ARG ARCH
 
 # Build the manager binary
-FROM golang:1.23@sha256:ad5c126b5cf501a8caef751a243bb717ec204ab1aa56dc41dc11be089fafcb4f AS manager-builder
+FROM golang:1.23@sha256:d56c3e08fe5b27729ee3834854ae8f7015af48fd651cd25d1e3bcf3c19830174 AS manager-builder
 
 WORKDIR /workspace
 
@@ -37,10 +37,12 @@ ARG LDFLAGS
 ARG GCFLAGS
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux GOARCH=${ARCH} go build -ldflags="${LDFLAGS}" -gcflags="${GCFLAGS}" -o manager main.go
+    CGO_ENABLED=0 GOOS=linux GOARCH=${ARCH} go build -ldflags="${LDFLAGS}" -gcflags="${GCFLAGS}" -o manager main.go  && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${ARCH} go build -ldflags="${LDFLAGS}" -gcflags="${GCFLAGS}" -o keep-ncp cmd/keep-ncp/main.go
+
 
 # Build the apply-crds binary
-FROM golang:1.23@sha256:ad5c126b5cf501a8caef751a243bb717ec204ab1aa56dc41dc11be089fafcb4f AS apply-crds-builder
+FROM golang:1.23@sha256:d56c3e08fe5b27729ee3834854ae8f7015af48fd651cd25d1e3bcf3c19830174 AS apply-crds-builder
 
 WORKDIR /workspace
 
@@ -75,6 +77,7 @@ FROM --platform=linux/${ARCH} registry.access.redhat.com/ubi8-micro:8.10
 
 WORKDIR /
 COPY --from=manager-builder /workspace/manager .
+COPY --from=manager-builder /workspace/keep-ncp .
 COPY --from=apply-crds-builder /workspace/apply-crds .
 COPY --from=apply-crds-builder /workspace/crds /crds
 

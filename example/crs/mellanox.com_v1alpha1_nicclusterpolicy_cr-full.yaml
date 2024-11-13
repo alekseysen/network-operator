@@ -24,7 +24,7 @@ spec:
   ofedDriver:
     image: doca-driver
     repository: nvcr.io/nvstaging/mellanox
-    version: 24.10-0.6.8.0-0
+    version: 24.10-0.7.0.0-0
     upgradePolicy:
       autoUpgrade: true
       drain:
@@ -64,7 +64,7 @@ spec:
   sriovDevicePlugin:
     image: sriov-network-device-plugin
     repository: ghcr.io/k8snetworkplumbingwg
-    version: v3.7.0
+    version: v3.8.0
     config: |
       {
         "resourceList": [
