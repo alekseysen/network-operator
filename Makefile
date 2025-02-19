@@ -20,6 +20,7 @@ REPO_PATH=$(ORG_PATH)/$(PACKAGE)
 CHART_PATH=$(CURDIR)/deployment/$(PACKAGE)
 TOOLSDIR=$(CURDIR)/hack/tools/bin
 MANIFESTDIR=$(CURDIR)/hack/manifests
+HACKTMPDIR=$(CURDIR)/hack/tmp
 BUILDDIR=$(CURDIR)/build/_output
 GOFILES=$(shell find . -name "*.go" | grep -vE "(\/vendor\/)|(_test.go)")
 TESTPKGS=./...
@@ -37,6 +38,7 @@ BUILD_VERSION := $(strip $(shell [ -d .git ] && git describe --always --tags --d
 BUILD_TIMESTAMP := $(shell date -u +"%Y-%m-%dT%H:%M:%S%Z")
 VCS_BRANCH := $(strip $(shell git rev-parse --abbrev-ref HEAD))
 VCS_REF := $(strip $(shell [ -d .git ] && git rev-parse --short HEAD))
+DOCA_DRIVER_RELEASE_URL := https://raw.githubusercontent.com/Mellanox/doca-driver-build/refs/heads/main/release_manifests/
 
 # Docker
 IMAGE_BUILDER?=docker
@@ -47,7 +49,7 @@ IMAGE_NAME?=network-operator
 CONTROLLER_IMAGE=$(REGISTRY)/$(IMAGE_NAME)
 IMAGE_BUILD_OPTS?=
 BUNDLE_IMG?=network-operator-bundle:$(VERSION)
-BUNDLE_OCP_VERSIONS=v4.14-v4.16
+BUNDLE_OCP_VERSIONS=v4.14-v4.17
 # BUNDLE_GEN_FLAGS are the flags passed to the operator-sdk generate bundle command
 BUNDLE_GEN_FLAGS ?= -q --overwrite --version $(VERSION) $(BUNDLE_METADATA_OPTS)
 BUILD_ARCH= amd64 arm64
@@ -108,6 +110,9 @@ $(MANIFESTDIR):
 
 $(BUILDDIR): ; $(info Creating build directory...)
 	mkdir -p $@
+
+$(HACKTMPDIR):
+	@mkdir -p $@
 
 build: generate $(BUILDDIR)/$(BINARY_NAME) ; $(info Building $(BINARY_NAME)...) @ ## Build executable file
 	$(info Done!)
@@ -356,6 +361,7 @@ clean: ; $(info  Cleaning...)	 @ ## Cleanup everything
 	@rm -rf $(BUILDDIR)
 	@rm -rf $(TOOLSDIR)
 	@rm -rf $(MANIFESTDIR)
+	@rm -rf $(HACKTMPDIR)
 
 .PHONY: help
 help: ## Show this message
@@ -391,6 +397,8 @@ generate: $(CONTROLLER_GEN) ## Generate code
 
 .PHONY: bundle
 bundle: $(OPERATOR_SDK) $(KUSTOMIZE) manifests ## Generate bundle manifests and metadata, then validate generated files.
+	cd hack && $(GO) run release.go --with-sha256 --templateDir ./templates/config/manager --outputDir ../config/manager/
+	cd hack && $(GO) run release.go --with-sha256 --templateDir ./templates/samples/ --outputDir ../config/samples/
 	$(OPERATOR_SDK) generate kustomize manifests -q
 	cd config/manager && $(KUSTOMIZE) edit set image controller=$(TAG)
 	$(KUSTOMIZE) build config/manifests | $(OPERATOR_SDK) generate bundle $(BUNDLE_GEN_FLAGS)
@@ -409,10 +417,14 @@ bundle-push: ## Push the bundle image.
 .PHONY: release-build
 release-build:
 	yq '.[].version'  hack/release.yaml | grep 'latest' && exit 1 || true
-	cd hack && $(GO) run release.go --templateDir ./templates/samples/ --outputDir ../config/samples/
 	cd hack && $(GO) run release.go --templateDir ./templates/crs/ --outputDir ../example/crs
 	cd hack && $(GO) run release.go --templateDir ./templates/values/ --outputDir ../deployment/network-operator/
-	cd hack && $(GO) run release.go --templateDir ./templates/config/manager --outputDir ../config/manager/
+
+.PHONY: check-doca-drivers
+check-doca-drivers: $(HACKTMPDIR)
+	$(eval DRIVERVERSION := $(shell yq '.Mofed.version'  hack/release.yaml | cut -d'-' -f1))
+	wget $(DOCA_DRIVER_RELEASE_URL)$(DRIVERVERSION).yaml  -O $(HACKTMPDIR)/doca-driver-matrix.yaml
+	cd hack && $(GO) run release.go --doca-driver-check --doca-driver-matrix $(HACKTMPDIR)/doca-driver-matrix.yaml
 
 # dev environment
 

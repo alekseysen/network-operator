@@ -30,6 +30,8 @@ import (
 
 	"sigs.k8s.io/yaml"
 
+	yamlflow "gopkg.in/yaml.v3"
+
 	mellanoxv1alpha1 "github.com/Mellanox/network-operator/api/v1alpha1"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -49,6 +51,8 @@ type ReleaseImageSpec struct {
 type SHA256ImageRef struct {
 	// ImageRef is the image reference in "sha format" e.g repo/project/image-repo@sha256:abcdef
 	ImageRef string
+	// SHA256 is the SHA256 of the image reference e.g sha256:abcdef
+	SHA256 string
 	// Name is a description of the image reference
 	Name string
 }
@@ -77,6 +81,20 @@ type Release struct {
 	RDMACni                      *ReleaseImageSpec
 	NicConfigurationOperator     *ReleaseImageSpec
 	NicConfigurationConfigDaemon *ReleaseImageSpec
+	MaintenanceOperator          *ReleaseImageSpec
+}
+
+// DocaDriverMatrix represent the expected DOCA-Driver OS/arch combinations
+type DocaDriverMatrix struct {
+	Precompiled []struct {
+		OS      string   `yaml:"os"`
+		Arch    []string `yaml:"archs,flow"`
+		Kernels []string `yaml:"kernels,flow"`
+	} `yaml:"precompiled"`
+	DynamicallyCompiled []struct {
+		OS     string   `yaml:"os,flow"`
+		Arches []string `yaml:"archs,flow"`
+	} `yaml:"dynamically_compiled"`
 }
 
 func readDefaults(releaseDefaults string) Release {
@@ -127,6 +145,7 @@ func readEnvironmentVariables(release *Release) {
 	initWithEnvVariale("RDMA_CNI", release.RDMACni)
 	initWithEnvVariale("NIC_CONFIGURATION_OPERATOR", release.NicConfigurationOperator)
 	initWithEnvVariale("NIC_CONFIGURATION_CONFIG_DAEMON", release.NicConfigurationConfigDaemon)
+	initWithEnvVariale("MAINTENANCE_OPERATOR", release.MaintenanceOperator)
 }
 
 func main() {
@@ -134,11 +153,83 @@ func main() {
 	outputDir := flag.String("outputDir", ".", "Destination directory to render templates to")
 	releaseDefaults := flag.String("releaseDefaults", "release.yaml", "Destination of the release defaults definition")
 	retrieveSha := flag.Bool("with-sha256", false, "retrieve SHA256 for container images references")
+	docaDriverCheck := flag.Bool("doca-driver-check", false, "Verify DOCA Driver tags")
+	docaDriverMatrix := flag.String("doca-driver-matrix", "tmp/doca-driver-matrix.yaml", "DOCA Driver tags matrix")
 	flag.Parse()
 	release := readDefaults(*releaseDefaults)
 	readEnvironmentVariables(&release)
+
+	if *docaDriverCheck {
+		docaDriverTagsCheck(&release, docaDriverMatrix)
+	} else {
+		renderTemplates(&release, templateDir, outputDir, retrieveSha)
+	}
+}
+
+func docaDriverTagsCheck(release *Release, docaDriverMatrix *string) {
+	f, err := os.ReadFile(filepath.Clean(*docaDriverMatrix))
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+	var config DocaDriverMatrix
+	if err := yamlflow.Unmarshal(f, &config); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+	tags, err := listTags(release.Mofed.Repository, release.Mofed.Image)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+	if err := validateTags(config, tags, release.Mofed.Version); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func validateTags(config DocaDriverMatrix, tags []string, version string) error {
+	// Build expected OS-arch combinations
+	expectedCombinations := make(map[string]struct{})
+	for _, entry := range config.DynamicallyCompiled {
+		for _, arch := range entry.Arches {
+			key := fmt.Sprintf("%s-%s", entry.OS, arch)
+			expectedCombinations[key] = struct{}{}
+		}
+	}
+
+	// Filter tags based on version prefix
+	filteredTags := []string{}
+	for _, tag := range tags {
+		if strings.HasPrefix(tag, version) {
+			filteredTags = append(filteredTags, tag)
+		}
+	}
+
+	unfound := make([]string, 0)
+	// Validate if each expected combination exists in the filtered tags
+	for combo := range expectedCombinations {
+		found := false
+		for _, tag := range filteredTags {
+			if strings.Contains(tag, combo) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			unfound = append(unfound, combo)
+		}
+	}
+	if len(unfound) > 0 {
+		return fmt.Errorf("missing os-arch combinations: %v", unfound)
+	}
+
+	return nil
+}
+
+func renderTemplates(release *Release, templateDir, outputDir *string, retrieveSha *bool) {
 	if *retrieveSha {
-		err := resolveImagesSha(&release)
+		err := resolveImagesSha(release)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
@@ -175,6 +266,10 @@ func main() {
 				imageSpec := obj.(*ReleaseImageSpec)
 				return imageSpec.Shas[0].ImageRef
 			},
+			"Sha256": func(obj interface{}) string {
+				imageSpec := obj.(*ReleaseImageSpec)
+				return imageSpec.Shas[0].SHA256
+			},
 		}).ParseFiles(file)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
@@ -196,15 +291,22 @@ func main() {
 	}
 }
 
+func getAuth(repo string) remote.Option {
+	if strings.Contains(repo, "nvstaging") {
+		nvcrToken := os.Getenv("NGC_CLI_API_KEY")
+		if nvcrToken == "" {
+			log.Fatalf("NGC_CLI_API_KEY is unset")
+		}
+		authNvcr := &authn.Basic{
+			Username: "$oauthtoken",
+			Password: nvcrToken,
+		}
+		return remote.WithAuth(authNvcr)
+	}
+	return remote.WithAuthFromKeychain(authn.DefaultKeychain)
+}
+
 func resolveImagesSha(release *Release) error {
-	nvcrToken := os.Getenv("NGC_CLI_API_KEY")
-	if nvcrToken == "" {
-		return fmt.Errorf("NGC_CLI_API_KEY is unset")
-	}
-	auth := &authn.Basic{
-		Username: "$oauthtoken",
-		Password: nvcrToken,
-	}
 	v := reflect.ValueOf(*release)
 	for i := 0; i < v.NumField(); i++ {
 		field := v.Field(i)
@@ -212,48 +314,41 @@ func resolveImagesSha(release *Release) error {
 			releaseImageSpec := field.Interface().(*ReleaseImageSpec)
 			if strings.Contains(releaseImageSpec.Image, "doca-driver") {
 				digests, err := resolveDocaDriversShas(releaseImageSpec.Repository, releaseImageSpec.Image,
-					releaseImageSpec.Version, auth)
+					releaseImageSpec.Version)
 				if err != nil {
 					return err
 				}
 				releaseImageSpec.Shas = make([]SHA256ImageRef, len(digests))
 				for i, digest := range digests {
 					sha := fmt.Sprintf("%s/%s@%s", releaseImageSpec.Repository, releaseImageSpec.Image, digest)
-					releaseImageSpec.Shas[i] = SHA256ImageRef{ImageRef: sha, Name: fmt.Sprintf("doca-driver-%d", i)}
+					releaseImageSpec.Shas[i] = SHA256ImageRef{ImageRef: sha, Name: fmt.Sprintf("doca-driver-%d", i), SHA256: digest}
 				}
 			} else {
 				digest, err := resolveImageSha(releaseImageSpec.Repository, releaseImageSpec.Image,
-					releaseImageSpec.Version, auth)
+					releaseImageSpec.Version)
 				if err != nil {
 					return err
 				}
 				releaseImageSpec.Shas = make([]SHA256ImageRef, 1)
 				sha := fmt.Sprintf("%s/%s@%s", releaseImageSpec.Repository, releaseImageSpec.Image, digest)
-				releaseImageSpec.Shas[0] = SHA256ImageRef{ImageRef: sha}
+				releaseImageSpec.Shas[0] = SHA256ImageRef{ImageRef: sha, SHA256: digest}
 			}
 		}
 	}
 	return nil
 }
 
-func resolveImageSha(repo, image, tag string, auth *authn.Basic) (string, error) {
+func resolveImageSha(repo, image, tag string) (string, error) {
 	ref, err := containerregistryname.ParseReference(fmt.Sprintf("%s/%s:%s", repo, image, tag))
 	if err != nil {
 		return "", err
 	}
-	var desc *remote.Descriptor
-	if strings.Contains(repo, "nvstaging") {
-		desc, err = remote.Get(ref, remote.WithAuth(auth))
-		if err != nil {
-			return "", err
-		}
-	} else {
-		// Container registry might fail if providing unneeded auth
-		desc, err = remote.Get(ref)
-		if err != nil {
-			return "", err
-		}
+	auth := getAuth(repo)
+	desc, err := remote.Get(ref, auth)
+	if err != nil {
+		return "", err
 	}
+
 	digest, err := containerregistryv1.NewHash(desc.Descriptor.Digest.String())
 	if err != nil {
 		return "", err
@@ -261,31 +356,32 @@ func resolveImageSha(repo, image, tag string, auth *authn.Basic) (string, error)
 	return digest.String(), nil
 }
 
-func resolveDocaDriversShas(repoName, imageName, ver string, auth *authn.Basic) ([]string, error) {
-	shaArray := make([]string, 0)
+func listTags(repoName, imageName string) ([]string, error) {
+	tags := make([]string, 0)
 	image := fmt.Sprintf("%s/%s", repoName, imageName)
 	repo, err := containerregistryname.NewRepository(image)
 	if err != nil {
-		return shaArray, err
+		return tags, err
 	}
-	var tags []string
-	if strings.Contains(repoName, "nvstaging") {
-		tags, err = remote.List(repo, remote.WithAuth(auth))
-		if err != nil {
-			return shaArray, err
-		}
-	} else {
-		// Container registry might fail if providing unneeded auth
-		tags, err = remote.List(repo)
-		if err != nil {
-			return shaArray, err
-		}
+	auth := getAuth(repoName)
+	tags, err = remote.List(repo, auth)
+	if err != nil {
+		return tags, err
 	}
 	sort.Strings(tags)
+	return tags, nil
+}
+
+func resolveDocaDriversShas(repoName, imageName, ver string) ([]string, error) {
+	shaArray := make([]string, 0)
+	tags, err := listTags(repoName, imageName)
+	if err != nil {
+		return shaArray, err
+	}
 	shaSet := make(map[string]interface{})
 	for _, tag := range tags {
 		if strings.Contains(tag, ver) && (strings.Contains(tag, "rhcos") || strings.Contains(tag, "rhel")) {
-			digest, err := resolveImageSha(repoName, imageName, tag, auth)
+			digest, err := resolveImageSha(repoName, imageName, tag)
 			if err != nil {
 				return shaArray, err
 			}

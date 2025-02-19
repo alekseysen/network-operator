@@ -58,18 +58,18 @@ const (
 	stateOFEDName        = "state-OFED"
 	stateOFEDDescription = "OFED driver deployed in the cluster"
 
-	// mofedImageFormat is the mofed driver container image name format
-	// format: <repo>/<image-name>:<driver-version>-<os-name><os-ver>-<cpu-arch>
-	// e.x: nvcr.io/nvidia/mellanox/mofed:5.7-0.1.2.0-ubuntu20.04-amd64
+	// mofedImageFormat is the DOCA driver container image name format
+	// format: <repo>/<image-name>:<driver-container-version>-<os-name><os-ver>-<cpu-arch>
+	// e.x: nvcr.io/nvidia/mellanox/doca-driver:5.7-0.1.2.0-0-ubuntu20.04-amd64
 	mofedImageFormat = "%s/%s:%s-%s%s-%s"
 
 	// precompiledTagFormat is the tag format for precompiled drivers.
-	// format: <driver-version>-<kernel-full>-<os-name><os-ver>-<cpu-arch>
+	// format: <container-driver-version>-<kernel-full>-<os-name><os-ver>-<cpu-arch>
 	precompiledTagFormat = "%s-%s-%s%s-%s"
 
-	// precompiledImageFormat is the precompiled mofed driver container image name format
-	// format: <repo>/<image-name>:<driver-version>-<kernel-full>-<os-name><os-ver>-<cpu-arch>
-	// e.x: nvcr.io/nvidia/mellanox/mofed:5.7-0.1.2.0-5.15.0-91-generic-ubuntu22.04-amd64
+	// precompiledImageFormat is the precompiled DOCA driver container image name format
+	// format: <repo>/<image-name>:<driver-container-version>-<kernel-full>-<os-name><os-ver>-<cpu-arch>
+	// e.x: nvcr.io/nvidia/mellanox/doca-driver:5.7-0.1.2.0-0-5.15.0-91-generic-ubuntu22.04-amd64
 	precompiledImageFormat = "%s/%s:%s-%s-%s%s-%s"
 )
 
@@ -111,6 +111,7 @@ var CertConfigPathMap = map[string]string{
 	"ubuntu": "/etc/ssl/certs",
 	"rhcos":  "/etc/pki/ca-trust/extracted/pem",
 	"rhel":   "/etc/pki/ca-trust/extracted/pem",
+	"sles":   "/etc/ssl",
 }
 
 // RepoConfigPathMap indicates standard OS specific paths for repository configuration files
@@ -118,6 +119,7 @@ var RepoConfigPathMap = map[string]string{
 	"ubuntu": "/etc/apt/sources.list.d",
 	"rhcos":  "/etc/yum.repos.d",
 	"rhel":   "/etc/yum.repos.d",
+	"sles":   "/etc/zypp/repos.d",
 }
 
 // MountPathToVolumeSource maps a container mount path to a VolumeSource
@@ -145,6 +147,20 @@ var SubscriptionPathMap = map[string]MountPathToVolumeSource{
 			HostPath: &v1.HostPathVolumeSource{
 				Path: "/etc/rhsm",
 				Type: newHostPathType(v1.HostPathDirectory),
+			},
+		},
+	},
+	"sles": {
+		"/etc/zypp/credentials.d": v1.VolumeSource{
+			HostPath: &v1.HostPathVolumeSource{
+				Path: "/etc/zypp/credentials.d",
+				Type: newHostPathType(v1.HostPathDirectory),
+			},
+		},
+		"/etc/SUSEConnect": v1.VolumeSource{
+			HostPath: &v1.HostPathVolumeSource{
+				Path: "/etc/SUSEConnect",
+				Type: newHostPathType(v1.HostPathFileOrCreate),
 			},
 		},
 	},
@@ -829,8 +845,8 @@ func (s *stateOFED) handleCertConfig(
 func (s *stateOFED) handleSubscriptionVolumes(
 	ctx context.Context, osname string, runtime string, mounts *additionalVolumeMounts) error {
 	reqLogger := log.FromContext(ctx)
-	if osname == "rhel" && runtime != nodeinfo.CRIO {
-		reqLogger.V(consts.LogLevelDebug).Info("Setting subscription mounts for RHEL with non CRIO container runtime")
+	if (osname == "rhel" && runtime != nodeinfo.CRIO) || osname == "sles" {
+		reqLogger.V(consts.LogLevelDebug).Info("Setting subscription mounts for OS:%s, runtime:%s", osname, runtime)
 		pathToVolumeSource, ok := SubscriptionPathMap[osname]
 		if !ok {
 			return fmt.Errorf("failed to find subscription volumes definition for os: %v", osname)

@@ -19,17 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - if: github.ref_type == 'branch'
-      name: Determine docker tags (when git branch)
+    - name: Determine docker tags
       run: |
-        git_sha=$(git rev-parse --short HEAD)  # short git commit hash
+        git_sha=$(git rev-parse --short HEAD)                                  # short git commit hash
+        git_tag=${{ github.ref_type == 'tag' && github.ref_name || '' }}       # git tag, if triggered by tag event
         latest=${{ github.ref_name == env.DEFAULT_BRANCH && 'latest' || '' }}  # 'latest', if branch is master
-        echo DOCKER_TAGS=""$git_sha $latest"" >> $GITHUB_ENV
-    - if: github.ref_type == 'tag'
-      name: Determine docker tags (when git tag)
-      run: |
-        git_tag=${{ github.ref_name }}
-        echo DOCKER_TAGS=""$git_tag"" >> $GITHUB_ENV
+        echo DOCKER_TAGS=""$git_sha $git_tag $latest"" | tee -a $GITHUB_ENV
     - uses: docker/login-action@v3
       with:
         registry: ${{ env.REGISTRY }}
@@ -43,31 +38,19 @@ jobs:
         for docker_tag in $DOCKER_TAGS; do
           make VERSION=$docker_tag image-build-multiarch image-push-multiarch
         done
+    outputs:
+      default_branch: ${{ env.DEFAULT_BRANCH }}  # we output this here, to use in the following job's conditioning (due to github actions environment variable scope limitations).
 
   helm-package-publish:
+    if:  github.ref_type == 'tag' || github.ref_name == ${{ needs.docker-build-push.outputs.default_branch }}
     needs:
     - docker-build-push
     runs-on: ubuntu-latest
+    env:
+      NGC_REPO: nvstaging/mellanox/network-operator
     steps:
-    - if: github.ref_name == env.DEFAULT_BRANCH || github.ref_type == 'tag'
-      uses: actions/checkout@v4
-    - if: github.ref_name == env.DEFAULT_BRANCH
-      name: Determine versions (when git branch)
-      run: |
-        app_version=$(git rev-parse --short HEAD)  # short git commit hash
-        current_chart_version=$(yq '.version' deployment/network-operator/Chart.yaml)
-        echo APP_VERSION=""$app_version""                    >> $GITHUB_ENV
-        echo VERSION=""$current_chart_version-$app_version"" >> $GITHUB_ENV
-    - if: github.ref_type == 'tag'
-      name: Determine versions (when git tag)
-      run: |
-        git_tag=${{ github.ref_name }}
-        app_version=$git_tag
-        chart_version=${git_tag:1}  # without the 'v' prefix
-        echo APP_VERSION=""$app_version"" >> $GITHUB_ENV
-        echo VERSION=""$chart_version""   >> $GITHUB_ENV
-    - if: github.ref_name == env.DEFAULT_BRANCH || github.ref_type == 'tag'
-      name: NGC setup and authentication
+    - uses: actions/checkout@v4
+    - name: NGC setup and authentication
       run: |
         wget \
           --no-verbose \
@@ -84,15 +67,19 @@ jobs:
           mellanox
           no-ace
         EOF
-    - if: github.ref_name == env.DEFAULT_BRANCH || github.ref_type == 'tag'
-      name: Make package and push
-      env:
-        NGC_REPO: nvstaging/mellanox/network-operator
+    - name: Make package and push (`current_version+git_sha` as chart version)
       run: |
-        make chart-build chart-push
+        git_sha=$(git rev-parse --short HEAD)  # short git commit hash
+        current_chart_version=$(yq '.version' deployment/network-operator/Chart.yaml)
+        APP_VERSION=$git_sha VERSION=$current_chart_version-$git_sha make chart-build chart-push \
+          2> >(tee error.log) || grep 'already exists in the repository' error.log  # catches any errors to `error.log`; if there is a specific error - passes (exit 0)
+    - name: Make package and push (`git_tag` as chart version)
+      if: github.ref_type == 'tag'
+      run: |
+        git_tag=${{ github.ref_name }}
+        APP_VERSION=$git_tag VERSION=${git_tag:1} make chart-build chart-push  # VERSION as 'v' prefix removed
 
   ocp-bundle:
-    if: github.ref_type == 'tag'
     needs:
     - docker-build-push
     runs-on: ubuntu-latest
@@ -104,33 +91,73 @@ jobs:
     - uses: actions/checkout@v4
       with:
         token: ${{ secrets.GH_TOKEN_NVIDIA_CI_CD }}  # token must be explicitly set here for push to work in following step
+    - name: Set is_push flag
+      id: set-is-push
+      run: |
+        if [[ "${{ github.event_name }}" == "push" && "${{ github.ref_type }}" == "tag" ]]; then
+          echo "is_push=false" >> $GITHUB_ENV
+        else
+          echo "is_push=true" >> $GITHUB_ENV
+        fi
+    - name: Determine version, tag, and base branch - Process based on is_push flag
+      run: |
+        if [[ "$is_push" == "true" ]]; then
+          echo "Setting VERSION_WITH_PREFIX to git commit hash."
+          VERSION_WITH_PREFIX=$(git rev-parse --short HEAD)
+          echo VERSION_WITH_PREFIX=$VERSION_WITH_PREFIX >> $GITHUB_ENV
+        else
+          git_tag=${{ github.ref_name }}
+          echo VERSION_WITH_PREFIX=$git_tag >> $GITHUB_ENV
+          echo VERSION_WITHOUT_PREFIX=${git_tag:1} >> $GITHUB_ENV  # without the 'v' prefix
+          if echo $git_tag | grep beta; then
+            base_branch=$DEFAULT_BRANCH
+          else
+            v_major_minor=$(echo $git_tag | grep -Eo '^v[0-9]+\.[0-9]+')
+            base_branch=$v_major_minor.x
+          fi
+          echo BASE_BRANCH=$base_branch >> $GITHUB_ENV
+        fi
     - uses: docker/login-action@v3
       with:
         registry: ${{ env.REGISTRY }}
         username: ${{ secrets.NVCR_USERNAME }}
         password: ${{ secrets.NVCR_TOKEN }}
-    - name: Determine version and tag
-      run: |
-        git_tag=${{ github.ref_name }}
-        echo VERSION_WITH_PREFIX=$git_tag        >> $GITHUB_ENV
-        echo VERSION_WITHOUT_PREFIX=${git_tag:1} >> $GITHUB_ENV  # without the 'v' prefix
     - name: Lookup image digest
       run: |
-        network_operator_digest=$(skopeo inspect docker://$REGISTRY/$IMAGE_NAME:$VERSION_WITH_PREFIX | jq -r .Digest)
+        if [[ "$is_push" == "false" && "$VERSION_WITH_PREFIX" != *-* ]]; then
+          IMAGE_REGISTRY="nvcr.io/nvidia/cloud-native" # GA release
+        else
+          IMAGE_REGISTRY=$REGISTRY
+        fi
+        network_operator_digest=$(skopeo inspect docker://$IMAGE_REGISTRY/$IMAGE_NAME:$VERSION_WITH_PREFIX | jq -r .Digest)
         echo $network_operator_digest | wc -w | grep 1  # verifies value not empty
         echo NETWORK_OPERATOR_DIGEST=$network_operator_digest >> $GITHUB_ENV
+        echo IMAGE_REGISTRY=$IMAGE_REGISTRY >>  $GITHUB_ENV
     - name: Make bundle
       env:
-        TAG: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ env.NETWORK_OPERATOR_DIGEST }}
+        TAG: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ env.NETWORK_OPERATOR_DIGEST }}
         BUNDLE_IMG: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-bundle:${{ env.VERSION_WITH_PREFIX }}
-        VERSION: ${{ env.VERSION_WITHOUT_PREFIX }}
         NGC_CLI_API_KEY: ${{ secrets.NVCR_TOKEN }}
       run: |
-        version_major_minor=$(echo $VERSION_WITH_PREFIX | grep -Eo 'v[0-9]+\.[0-9]+')
-        export CHANNELS=stable,$version_major_minor
-        export DEFAULT_CHANNEL=$version_major_minor
+        if [[ "$is_push" == "false" ]]; then
+          export VERSION=${{ env.VERSION_WITHOUT_PREFIX }}
+          version_major_minor=$(echo $VERSION_WITH_PREFIX | grep -Eo 'v[0-9]+\.[0-9]+')
+          export CHANNELS=stable,$version_major_minor
+          export DEFAULT_CHANNEL=$version_major_minor
+        else
+          export DEFAULT_CHANNEL=v1.1 # hard coded
+          export CHANNELS=stable,v1.1 # hard coded
+          export VERSION=1.1.0-${{ env.VERSION_WITH_PREFIX }}  # using the commit hash
+          export NETWORK_OPERATOR_VERSION=${{ env.VERSION_WITH_PREFIX }} # for push use commit sha
+        fi
         make bundle bundle-build bundle-push
+        if [[ "$is_push" == "true" ]]; then
+          export BUNDLE_IMG=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-bundle:latest  # hard coded
+          make bundle-build bundle-push
+        fi
+
     - name: Create PR with bundle to Network Operator
+      if: github.ref_type == 'tag'
       env:
         FEATURE_BRANCH: update-ocp-bundle-to-${{ env.VERSION_WITH_PREFIX }}
       run: |
@@ -140,24 +167,26 @@ jobs:
         git checkout -b $FEATURE_BRANCH
         git status
         git add bundle
+        git add bundle.Dockerfile
         git commit -sm "task: update bundle to $VERSION_WITH_PREFIX"
 
         git push -u origin $FEATURE_BRANCH
         gh pr create \
           --head $FEATURE_BRANCH \
-          --base $DEFAULT_BRANCH \
+          --base $BASE_BRANCH \
           --title "task: update bundle to $VERSION_WITH_PREFIX" \
           --body "Created by the *${{ github.job }}* job in [${{ github.repository }} OCP bundle CI](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
     - name: Determine if to send bundle to RedHat
+      if: github.ref_type == 'tag'
       run: |
         echo SEND_BUNDLE_TO_REDHAT=$(echo ${{ github.ref_name}} | grep -qE "v[0-9]+.[0-9]+.[0-9]+$" && echo true || echo false) >> $GITHUB_ENV
-    - if: ${{ env.SEND_BUNDLE_TO_REDHAT == 'true' }}
+    - if: ${{ github.ref_type == 'tag' && env.SEND_BUNDLE_TO_REDHAT == 'true' }}
       uses: actions/checkout@v4
       with:
         token: ${{ secrets.GH_TOKEN_NVIDIA_CI_CD }}  # token must be explicitly set here for push to work in following step
         repository: ${{ env.UPSTREAM_REPO_OWNER }}/certified-operators
         path: certified-operators
-    - if: ${{ env.SEND_BUNDLE_TO_REDHAT == 'true' }}
+    - if: ${{ github.ref_type == 'tag' && env.SEND_BUNDLE_TO_REDHAT == 'true' }}
       name: Create PR with bundle to RedHat
       env:
         UPSTREAM_DEFAULT_BRANCH: main

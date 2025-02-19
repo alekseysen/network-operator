@@ -53,7 +53,25 @@ var _ = Describe("SR-IOV Device Plugin State tests", func() {
 			By("Verify DaemonSet")
 			ds := &appsv1.DaemonSet{}
 			err = ts.client.Get(context.Background(), types.NamespacedName{Namespace: ts.namespace,
-				Name: "sriov-device-plugin"}, ds)
+				Name: "network-operator-sriov-device-plugin"}, ds)
+			Expect(err).NotTo(HaveOccurred())
+			assertCommonDaemonSetFields(ds, &cr.Spec.SriovDevicePlugin.ImageSpec, cr)
+			// expect privileged mode
+			Expect(*ds.Spec.Template.Spec.Containers[0].SecurityContext.Privileged).To(BeTrue())
+			assertSriovDpPodTemplatesVolumeFields(&ds.Spec.Template, false)
+			assertSriovDpPodTemplatesVolumeMountFields(&ds.Spec.Template, false)
+		})
+		It("should create Daemonset - minimal spec -SHA256 image format", func() {
+			By("Sync")
+			cr := getMinimalNicClusterPolicyWithSriovDp(false)
+			cr.Spec.SriovDevicePlugin.Version = defaultTestVersionSha256
+			status, err := ts.state.Sync(context.Background(), cr, ts.catalog)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(status).To(BeEquivalentTo(state.SyncStateNotReady))
+			By("Verify DaemonSet")
+			ds := &appsv1.DaemonSet{}
+			err = ts.client.Get(context.Background(), types.NamespacedName{Namespace: ts.namespace,
+				Name: "network-operator-sriov-device-plugin"}, ds)
 			Expect(err).NotTo(HaveOccurred())
 			assertCommonDaemonSetFields(ds, &cr.Spec.SriovDevicePlugin.ImageSpec, cr)
 			// expect privileged mode
@@ -70,7 +88,7 @@ var _ = Describe("SR-IOV Device Plugin State tests", func() {
 			By("Verify DaemonSet")
 			ds := &appsv1.DaemonSet{}
 			err = ts.client.Get(context.Background(), types.NamespacedName{Namespace: ts.namespace,
-				Name: "sriov-device-plugin"}, ds)
+				Name: "network-operator-sriov-device-plugin"}, ds)
 			Expect(err).NotTo(HaveOccurred())
 			assertCommonDaemonSetFields(ds, &cr.Spec.SriovDevicePlugin.ImageSpec, cr)
 			// expect privileged mode
@@ -90,7 +108,7 @@ var _ = Describe("SR-IOV Device Plugin State tests", func() {
 			By("Verify DaemonSet")
 			ds := &appsv1.DaemonSet{}
 			err = ts.client.Get(context.Background(), types.NamespacedName{Namespace: ts.namespace,
-				Name: "sriov-device-plugin"}, ds)
+				Name: "network-operator-sriov-device-plugin"}, ds)
 			Expect(err).NotTo(HaveOccurred())
 			assertCommonDaemonSetFields(ds, &cr.Spec.SriovDevicePlugin.ImageSpec, cr)
 			assertSriovDpPodTemplatesVolumeFields(&ds.Spec.Template, false)
@@ -121,7 +139,7 @@ var _ = Describe("SR-IOV Device Plugin State tests", func() {
 			By("Verify DaemonSet")
 			ds := &appsv1.DaemonSet{}
 			err = ts.client.Get(context.Background(), types.NamespacedName{Namespace: ts.namespace,
-				Name: "sriov-device-plugin"}, ds)
+				Name: "network-operator-sriov-device-plugin"}, ds)
 			Expect(err).NotTo(HaveOccurred())
 			assertCommonDaemonSetFields(ds, &cr.Spec.SriovDevicePlugin.ImageSpec, cr)
 			assertSriovDpPodTemplatesVolumeFields(&ds.Spec.Template, false)
@@ -134,7 +152,7 @@ var _ = Describe("SR-IOV Device Plugin State tests", func() {
 			By("Verify DaemonSet is deleted")
 			ds = &appsv1.DaemonSet{}
 			err = ts.client.Get(context.Background(), types.NamespacedName{Namespace: ts.namespace,
-				Name: "sriov-device-plugin"}, ds)
+				Name: "network-operator-sriov-device-plugin"}, ds)
 			Expect(errors.IsNotFound(err)).To(BeTrue())
 		})
 	})
@@ -196,7 +214,7 @@ func assertSriovDpPodTemplatesVolumeFields(tpl *v1.PodTemplateSpec, useCdi bool)
 			VolumeSource: v1.VolumeSource{
 				ConfigMap: &v1.ConfigMapVolumeSource{
 					LocalObjectReference: v1.LocalObjectReference{
-						Name: "sriovdp-config",
+						Name: "network-operator-sriovdp-config",
 					},
 					Items: []v1.KeyToPath{
 						{
